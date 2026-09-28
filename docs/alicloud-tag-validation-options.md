@@ -20,12 +20,12 @@
 | **1** | **Custom run task + Tag Validation Service** | Live, relational ServiceNow/SAP checks on every plan, including PR speculative plans, and again just before apply. Results are shown per resource in the HCP Terraform run UI. | ⭐ **Primary gate** |
 | **2** | **Sentinel policy set against a daily snapshot** (an OPA variant is possible) | Deterministic baseline with no runtime dependency. This *is* the "static file" fallback. | ✅ **Ship first** (quick win) and keep as the safety net |
 | **3** | **"Golden tags" Terraform module** (`data "http"` + postcondition) | Fast feedback while writing code, and consistent tags (the AliCloud provider has no `default_tags`). It is the only in-platform option that also works for **HCP Terraform Stacks** today. | ✅ Developer experience layer, but not a control on its own |
-| **4** | **Alibaba Cloud Tag Policy + Cloud Config** | Blocks or flags bad tags on resources created *outside* Terraform, and catches drift | ✅ Runtime backstop |
+| **4** | **Alibaba Cloud Tag Policy + Cloud Config** | Blocks wrong values for a subset of resource types (ECS family, RDS, …) at the cloud API. Flags missing or invalid tags on everything else, including resources created *outside* Terraform and drift. | ✅ Runtime backstop |
 | – | *Terraform policy (HCL, beta)* | Native HTTP lookups, post-apply evaluation, Stacks support | 👀 Watch; re-evaluate at GA |
 
 **Two facts change the design. Please confirm them:**
 
-1. **HCP Terraform edition.** On **Premium**, run tasks and policy evaluations can execute *inside your network* through your self-hosted agents, so nothing is exposed inbound. On **Standard**, the run task endpoint must be reachable from HCP Terraform's published IP ranges, and hosted policy evaluations cannot reach private APIs.
+1. **HCP Terraform edition.** Run tasks are available on every plan, but policy enforcement (Sentinel/OPA) needs **Standard** or **Premium**. On **Premium**, run tasks and policy evaluations can also execute *inside your network* through your self-hosted agents, so nothing is exposed inbound. On **Standard**, the run task endpoint must be reachable from HCP Terraform's published IP ranges, and hosted policy evaluations cannot reach private APIs.
 2. **Workspaces or HCP Terraform Stacks?** Stacks support **neither run tasks nor Sentinel/OPA** today. If "IaC stacks" means HCP Terraform *Stacks*, use Options 3 and 4 until Terraform policy is GA.
 
 ---
@@ -67,22 +67,25 @@ flowchart LR
 
 ## 3. Platform facts that drive the design
 
-Verified against HashiCorp's documentation source (`hashicorp/web-unified-docs` @ `a6140de`, 2026-09-28) and the provider repositories. See [Sources](#sources).
+Verified on 2026-09-28 against the live HashiCorp documentation (plus its source repo `hashicorp/web-unified-docs` @ `a6140de`), the Alibaba Cloud documentation, and the provider repositories. See [Sources](#sources).
 
 | # | Fact | Design impact |
 |---|---|---|
 | F1 | Run tasks can run at **pre-plan, post-plan, pre-apply and post-apply**, with **advisory** or **mandatory** enforcement. A mandatory task that fails (including a timeout) stops the run. | You can gate both after the plan and right before the apply. |
 | F2 | A run task gets a short-lived `access_token` and a `plan_json_api_url`, and must call back within **10 min** (progress) / **60 min** (total). The payload carries `is_speculative`. Results can include per-item **outcomes** shown in the UI. Requests are HMAC-SHA512 signed (`X-Tfc-Task-Signature`). | The service is asynchronous and stateless. It works on PR plans. |
 | F3 | Run task **source = Agent** (requests forwarded through your agents into private networks) needs **Premium**, plus agent ≥ 1.21.1 started with `-request-forwarding`. Otherwise HCP Terraform calls your URL from its `notifications` IP ranges. | This decides the network exposure of the service. |
-| F4 | Free edition: 1 run task on ≤ 10 workspaces. Org-wide ("global") run tasks need the `global-run-tasks` entitlement (beta); otherwise scope them to projects. | Scope the task at the project level. |
+| F4 | Plans: **run tasks on all plans** (Free: 1 run task on ≤ 10 workspaces). **Policy enforcement only on Standard and Premium.** Concurrent agent runs: Essentials 1, Standard 10, Premium 300. Org-wide ("global") run tasks need the `global-run-tasks` entitlement (beta); otherwise scope them to projects. | Option 2 needs Standard or higher. Scope the run task at the project level. |
 | F5 | Policy frameworks: **Sentinel, OPA, Terraform policy**. Legacy Sentinel *policy checks* support Sentinel ≤ 0.40.x only, so use **policy evaluations**. OPA runs only as a policy evaluation. | Create the Sentinel set with type **Agent** (policy evaluation). |
 | F6 | A policy evaluation runs **on your agents** only if you are on **Premium**, the workspace uses agent execution mode, and an agent accepts `policy` jobs. Otherwise it runs in HCP infrastructure. | Live lookups from a policy into private SAP need Premium. |
-| F7 | Sentinel's **`http` import** is usable in HCP Terraform policy sets (HashiCorp's own example uses it). Defaults: 10 s timeout, 1 retry, and any non-200 response is a policy error. The `sentinel` egress IP range applies to legacy policy checks only. | Hosted evaluations can't be IP-allowlisted, so live Sentinel lookups belong on Premium agents. |
+| F7 | Sentinel's **`http` import** is usable in HCP Terraform policy sets (HashiCorp's docs and its `http-examples` policy library use it). Defaults: 10 s timeout, 1 retry, and any non-200 response is a policy error. The `sentinel` egress IP range applies to legacy policy checks only. | Hosted evaluations can't be IP-allowlisted, so live Sentinel lookups belong on Premium agents. |
 | F8 | OPA in HCP Terraform receives `input.plan` / `input.run` and **cannot query external data** at evaluation time. Rego files are the only inputs. | Data has to come from a generated `.rego` snapshot. |
 | F9 | **Terraform policy** (HCL) is **beta** ("do not use beta features in production"). It has `core::gethttprequest`, wildcard `resource_policy "alicloud_*"`, and post-apply evaluation, and requires Terraform ≥ 1.16. | Strong future fit, but not for production yet. |
 | F10 | **Stacks:** run tasks ❌, policy as code ❌, except beta Terraform policy (which needs Terraform 1.17 alpha on Stacks). | Stacks need Option 3 and Option 4. |
 | F11 | The AliCloud provider has **no provider-level `default_tags`**, and some resources are not taggable (e.g. RAM users). | Tags must be passed per resource, so a shared module is needed. Policies must skip untaggable types. |
-| F12 | Alibaba Cloud **Tag Policy** can restrict allowed values per key, and with `enforced_for` it performs pre-event interception (blocks creation) for supported resource types. It is manageable as `alicloud_tag_policy`. **Cloud Config** has `required-tags` / `contains-tag` managed rules and Function Compute custom rules. | This is a cloud-side backstop. It works with allow-lists only and can't do relational checks. |
+| F12 | Alibaba Cloud **Tag Policy** (`alicloud_tag_policy`) restricts allowed values per key. Policy keys must be lowercase, and `tag_key` carries the case-sensitive tag name. Regex rules (`matched_tags`) can detect and remediate but **cannot intercept**. With `enforced_for`, **pre-event interception** by default blocks only a *wrong value* on a key that is present. *Strong validation*, which also blocks *missing* tags, is off by default, applies to the whole Resource Directory, and covers only ECS-family, ESS, ECI and ROS create APIs. | Allow-lists only, with no relational checks. See Option 4 for coverage. |
+| F13 | Interception coverage varies by API. At **create** time it covers the ECS family (instance, disk, ENI, security group, snapshot, launch template, …), RDS, Tair, ESS, ECI and ROS stacks. VPC, vSwitch, route table, NAT, EIP, SLB, ALB, CEN and MongoDB are checked only on **`TagResources`**. **OSS, PolarDB, NAS, ACK clusters, CDN, API Gateway and Alibaba Cloud DNS have no interception.** Alibaba warns interception can break ESS/ACK autoscaling if those services can't attach compliant tags. | Cloud-side blocking is partial by design. Keep plan-time gates (Options 1 and 2) primary. |
+| F14 | **Cloud Config** `required-tags` checks up to **6** key/value pairs (AND logic), is triggered by configuration change, and supports remediation. Custom rules invoke a Function Compute handler, which returns results via `PutEvaluations`. | Five mandatory keys fit one managed rule. SNOW/SAP value checks need a custom FC rule. |
+| F15 | Tag values: ≤ 128 characters; letters, digits, spaces and `_ . # / = + - @`; may not start with `aliyun` or `acs:`. Default quota: 20 tags per resource (varies by type). | Email owners and WBS codes such as `P-100234.01` are valid tag values. Keep mandatory tags well under the quota. |
 
 ---
 
@@ -104,8 +107,8 @@ flowchart LR
 ```
 
 - **Extract (read-only technical users):**
-  - *ServiceNow Table API:* `GET /api/now/table/cmdb_ci_business_app?sysparm_query=<operational filter>&sysparm_fields=number,it_application_owner.email,owned_by.email`. The dot-walked fields return owner emails in one call.
-  - *SAP S/4HANA:* cost centers (valid today, not locked) and WBS elements (released, with responsible cost center) via the Cost Center API and the Enterprise Project API (`API_ENTERPRISE_PROJECT_SRV;v=0002` → `A_EnterpriseProjectElement`). Prefer going through SAP API Management or Integration Suite rather than calling S/4 directly.
+  - *ServiceNow Table API:* `GET /api/now/table/cmdb_ci_business_app?sysparm_query=<operational filter>&sysparm_fields=number,it_application_owner.email,owned_by.email`. The Table API supports dot-walked fields in `sysparm_fields`, so owner emails come back in one call.
+  - *SAP S/4HANA:* cost centers (valid today, not locked) come from the cost center master-data API. WBS elements (released, with responsible cost center) come from the Enterprise Project API (`API_ENTERPRISE_PROJECT_SRV;v=0002` → `A_EnterpriseProjectElement`). Confirm the exact services for your S/4HANA edition on the SAP Business Accelerator Hub. Prefer going through SAP API Management or Integration Suite rather than calling S/4 directly.
 - **Normalize:** lower-case emails, trim values, keep only active/released records, and record `generated_at` plus source counts.
 - **Guardrails before publishing:** validate against a JSON schema, and **refuse to publish if record counts drop by more than ~5%**. A bad extract must never wipe out the allow-lists and block every deployment.
 - **Freshness SLO:** alert when the snapshot is older than 26 h. The policies fail when it is older than 48 h (configurable).
@@ -170,7 +173,7 @@ sequenceDiagram
 | Live data, with relational and complex rules (any logic, any source) | You own a service; its availability gates all AliCloud deployments |
 | Per-resource results in the run UI; the same check blocks PRs | On Standard, the endpoint must be internet-reachable (HMAC + IP allowlist mitigate this) |
 | Covers post-plan **and** pre-apply, and optionally post-apply | Not available for HCP Terraform Stacks |
-| Language- and engine-agnostic; easy to extend (naming rules, budget checks, …) | Free edition limits: 1 task / 10 workspaces |
+| Language- and engine-agnostic; easy to extend (naming rules, budget checks, …) | Free plan is limited to 1 run task on ≤ 10 workspaces |
 
 **Effort:** Medium. **Choose it when:** you need live or relational validation. That is your stated requirement.
 
@@ -190,7 +193,7 @@ terraform-cloud-policies/
 
 - **Rollout:** `advisory` → `soft-mandatory` (named teams can override, and the override is audited) → `hard-mandatory`.
 - **Policy set type: Agent** (policy evaluation), because legacy policy checks are frozen at Sentinel 0.40.x. On Premium with agent-mode workspaces it runs on your agents; otherwise it runs in HCP infrastructure. That is fine here because the snapshot needs **no network**.
-- **Optional live mode:** a Sentinel module can use the `http` import to call the Tag Validation Service. Only do this on **Premium** (evaluation on your agents), because hosted evaluations have no published egress IPs. It **fails closed**, since a non-200 response is a policy error, so keep the snapshot as the default and put the fallback logic in the service.
+- **Optional live mode:** a Sentinel module can use the `http` import to call the Tag Validation Service. Only do this on **Premium** (evaluation on your agents), because hosted evaluations have no published egress IPs. It **fails closed**, since a non-200 response is a policy error, so keep the snapshot as the default and put the fallback logic in the service. HashiCorp's [`http-examples`](https://github.com/hashicorp/terraform-sentinel-policies/tree/main/cloud-agnostic/http-examples) policies show the pattern, with the API token passed as a sensitive policy-set parameter.
 - **OPA variant ([Appendix B](#appendix-b-opa-variant)):** the same pattern with a generated `tag_reference.rego`. Pick OPA only if you want one policy language across Terraform, Kubernetes (Gatekeeper) and CI (`conftest`). In HCP Terraform, OPA has only advisory and mandatory levels (mandatory is overridable by anyone with *Manage Policy Overrides*), and it cannot fetch data.
 
 | ✅ Pros | ⚠️ Cons |
@@ -198,7 +201,7 @@ terraform-cloud-policies/
 | No new runtime component, only the sync job; deterministic and cheap | Data is up to ~24 h stale (acceptable for owners and cost centers; tighten the schedule if needed) |
 | Relational checks still work, because the snapshot carries the relationships | Snapshot lives in Git: prune it to active/released records only |
 | Unit-testable with `sentinel test` mocks (Appendix A: 6/6 passing) | Messages are plain log lines, less rich than run task outcomes |
-| Survives ServiceNow, SAP or service outages; a natural break-glass partner for Option 1 | Not available for Stacks; VCS-connected policy sets need Standard or higher |
+| Survives ServiceNow, SAP or service outages; a natural break-glass partner for Option 1 | Not available for Stacks. Policy enforcement needs the **Standard** or **Premium** plan |
 
 **Effort:** Small. **Choose it when:** you want enforcement in 1–2 weeks, and as a permanent baseline under Option 1.
 
@@ -220,21 +223,27 @@ terraform-cloud-policies/
 
 ### Option 4: Alibaba Cloud Tag Policy + Cloud Config (runtime backstop)
 
-**How it works.** A platform workspace manages `alicloud_tag_policy` (RD mode, attached to folders or accounts). The allowed-value lists for keys such as `CostCenter` are rendered daily from the snapshot, and `enforced_for` gives **pre-event interception** on high-value resource types. **Cloud Config** runs `required-tags` plus a **Function Compute custom rule** that checks existing resources against ServiceNow/SAP and reports or remediates.
+**How it works.** A platform workspace renders an `alicloud_tag_policy` (Resource Directory mode, attached to a folder) from the daily snapshot. See [Appendix E](#appendix-e-alibaba-cloud-tag-policy-and-cloud-config), validated against `aliyun/alicloud` 1.293.0. The policy combines three things:
+
+- **Allow-lists with interception** for low-cardinality keys (`CostCenter`, `ApplicationID`), with `enforced_for` limited to types that support create-time interception (e.g. `ecs:instance`, `rds:instance`).
+- **Regex rules (`matched_tags`)** for high-cardinality keys such as `WBSCode`. These detect and remediate but do not intercept.
+- **Cloud Config**: the `required-tags` managed rule (all five keys present) plus a **Function Compute custom rule** that checks values against ServiceNow/SAP and reports or remediates.
 
 ```json
-{"tags": {"CostCenter": {
+{"tags": {"costcenter": {
   "tag_key":      {"@@assign": "CostCenter"},
   "tag_value":    {"@@assign": ["CC10001", "CC20002"]},
-  "enforced_for": {"@@assign": ["ecs:instance"]}
+  "enforced_for": {"@@assign": ["ecs:instance", "rds:instance"]}
 }}}
 ```
 
+A wrong value is rejected by the cloud API with `Forbidden.TagPolicy`. By default a *missing* key is **not** blocked. Strong validation would block it, but only for ECS-family, ESS, ECI and ROS create APIs, and it applies Resource Directory-wide. Test in a non-production member first, and check ESS/ACK node scaling, as Alibaba recommends.
+
 | ✅ Pros | ⚠️ Cons |
 |---|---|
-| Covers console, CLI and other-tool changes, plus drift and **existing** resources (plan-time checks only see resources that change) | Allow-lists only: **no relational checks** (owner ↔ app, WBS ↔ cost center) |
-| Enforced by the cloud API itself; nothing to bypass for enforced types | Interception applies to supported resource types only; large WBS lists may hit policy-size limits (verify for your volumes) |
-| Cloud Config gives the compliance reporting FinOps wants | Failures surface **mid-apply** as API errors (partial applies), which is a poor primary developer experience |
+| Covers console, CLI and other-tool changes, plus drift and **existing** resources (plan-time checks only see resources that change) | Allow-lists and regex only: **no relational checks** (owner ↔ app, WBS ↔ cost center) |
+| Enforced by the cloud API itself for intercepted types | **Partial coverage** (F13). OSS, PolarDB, NAS and ACK clusters are never intercepted; VPC, SLB and similar only on `TagResources`. No published size limit for policy documents, so keep allow-lists to low-cardinality keys |
+| Cloud Config gives the compliance inventory and reporting FinOps wants | Failures surface **mid-apply** as API errors (partial applies), a poor primary developer experience. Interception can break autoscaling that attaches its own tags |
 
 **Effort:** Small to medium. **Choose it when:** you need coverage beyond Terraform and a compliance inventory.
 
@@ -253,10 +262,11 @@ HashiCorp now recommends Terraform policy for new governance work. It adds exact
 | Live ServiceNow/SAP data | ✅ cached | ⚠️ daily (live only on Premium) | ✅ via API | ❌ daily allow-lists |
 | Relational checks | ✅ | ✅ from snapshot | ✅ | ❌ |
 | Blocks at PR (speculative plan) | ✅ | ✅ | ✅ | ❌ |
-| Blocks before apply | ✅ post-plan + pre-apply | ✅ post-plan | ✅ plan fails | ⚠️ during apply |
-| Can developers bypass it? | No, if scoped at org/project level and teams lack run-task permissions | No; overrides are permission-gated and audited | **Yes** | No (enforced types) |
+| Blocks before apply | ✅ post-plan + pre-apply | ✅ post-plan | ✅ plan fails | ⚠️ during apply, wrong values only, for a subset of types |
+| Can developers bypass it? | No, if scoped at org/project level and teams lack run-task permissions | No; overrides are permission-gated and audited | **Yes** | No for intercepted types; detect-only elsewhere |
 | Non-Terraform resources and drift | ❌ | ❌ | ❌ | ✅ |
 | HCP Terraform Stacks | ❌ | ❌ | ✅ | ✅ |
+| Minimum HCP Terraform plan | Any (Premium for private/agent source) | **Standard** | Any (runs on your agents) | n/a |
 | Private SNOW/SAP reachability | Premium: agent forwarding · Standard: exposed endpoint | Not needed (snapshot) | ✅ via your agents | Function Compute in your VPC |
 | New component to operate | Service | Sync job only | Uses service API | None |
 | Failure UX | Per-resource outcomes in UI | Policy log lines | Plan error with exact tag | Cloud API error |
@@ -292,7 +302,7 @@ flowchart TB
 | 0: Decide | 0 | Tag contract and `ApplicationID` anchor; edition; workspaces vs Stacks; fail-closed rules; exception process | Signed off by FinOps and CMDB owners |
 | 1: Baseline | 1–2 | Sync job + snapshot; Sentinel set in **advisory** on AliCloud projects; speculative plans on and **HCP Terraform status required in GitHub branch protection**; golden module v1 | Violation baseline measured, false positives < 5% |
 | 2: Live gate | 3–6 | Tag Validation Service; run task post-plan **advisory → mandatory**, then pre-apply; Sentinel → **hard-mandatory**. Enforcement levels are per policy, so use a `create`-only copy of the policy as hard-mandatory and keep the `create`+`update` version advisory until legacy resources are backfilled | All AliCloud workspaces gated |
-| 3: Backstop | 6–10 | Alibaba Tag Policy (enforced for top resource types); Cloud Config custom rule; remediation campaign for existing resources | Compliance dashboard > 95% |
+| 3: Backstop | 6–10 | Cloud Config `required-tags` + custom FC rule (detect first); Alibaba Tag Policy with interception for ECS/RDS only, piloted on one non-production member, with ESS/ACK scaling checked; remediation campaign for existing resources | Compliance dashboard > 95% |
 | 4: Converge | At GA | Spike on Terraform policy; consider collapsing Options 1 and 2 into it (and use it for Stacks) | Decision record |
 
 > **Legacy resources:** an `update` to an old, untagged resource will fail the check even if the change is unrelated. Enforce on `create` first and `update` a few weeks later, and use Option 4's inventory to drive the backfill.
@@ -313,8 +323,8 @@ flowchart TB
 - **Endpoint hardening (Standard):** TLS, HMAC verification, WAF allowlist of HCP `notifications` ranges refreshed daily. On Premium, prefer agent request forwarding so there is no inbound path.
 - **Data handling:** never log the plan JSON; it can contain secrets.
 - **Integrity of the snapshot:** bot identity with signed commits, CODEOWNERS on the non-generated policy files, and schema plus count-delta checks before publishing.
-- **Exceptions:** soft-mandatory override restricted to a named team; require a ServiceNow ticket reference in the justification. Overrides are audit-logged by HCP Terraform.
-- **Correctness details:** tag values must be **known at plan time**. Terraform omits unknown values from the plan's `after` and flags them in `after_unknown`, so the policies explicitly reject tags that are unknown until apply rather than silently skipping them. Alibaba tags are case-sensitive, so normalize owner emails. Skip non-taggable types by checking for a `tags` attribute.
+- **Exceptions:** soft-mandatory override restricted to a named team; require a ServiceNow ticket reference in the justification. Overrides are visible in the run history, and in the audit trail on Premium, which is the only plan with audit logging.
+- **Correctness details:** tag values must be **known at plan time**. Terraform omits unknown values from the plan's `after` and flags them in `after_unknown`, so the policies explicitly reject tags that are unknown until apply rather than silently skipping them. Alibaba tag keys and values are case-sensitive, so normalize owner emails. Values are limited to 128 characters from letters, digits, spaces and `_ . # / = + - @`. Skip non-taggable types by checking for a `tags` attribute.
 - **Observability:** validation latency, source error rate, snapshot age, and violations per project. A post-apply webhook to ServiceNow (Service Graph Connector for Terraform; AliCloud needs custom ETL mappings) closes the CMDB loop.
 
 ---
@@ -334,9 +344,9 @@ flowchart TB
 
 ## Appendix A: Sentinel policy (tested)
 
-Tested with Sentinel 0.40.0 (`sentinel test`: 6/6 cases passing: valid tags, null tags, missing keys, relational mismatch with an unknown cost center, tags unknown until apply, and a stale snapshot). Untaggable types (`alicloud_ram_role`) and deletes are ignored.
+Tested with Sentinel 0.41.0 (latest) and 0.40.0 (the ceiling for legacy policy checks). `sentinel test`: 6/6 cases pass: valid tags, null tags, missing keys, relational mismatch with an unknown cost center, tags unknown until apply, and a stale snapshot). Untaggable types (`alicloud_ram_role`) and deletes are ignored.
 
-**`sentinel.hcl`**: HCP Terraform's policy-set docs use the `module` block. The Sentinel CLI marks it deprecated in favour of `import "module" "tag_reference" { source = ... }`, and both forms were tested.
+**`sentinel.hcl`**: HCP Terraform's policy-set docs and HashiCorp's own policy libraries use the `module` block. The Sentinel CLI (0.40 and 0.41) warns that it is deprecated in favour of `import "module" "tag_reference" { source = ... }`; both forms were tested.
 
 ```hcl
 module "tag_reference" {
@@ -577,7 +587,7 @@ deny contains msg if {
 
 ## Appendix C: Golden tags module
 
-Tested with Terraform 1.16.4 and `hashicorp/http` 3.6.2 against a mock validation API. Valid tags plan cleanly, invalid values fail with the API's error list, and bad formats fail at variable validation.
+Tested with Terraform 1.16.4 and `hashicorp/http` 3.6.2 (installed and signature-checked from the Terraform Registry) against a mock validation API. Valid tags plan cleanly, invalid values fail with the API's error list, and bad formats fail at variable validation.
 
 ```hcl
 terraform {
@@ -717,14 +727,103 @@ if __name__ == "__main__":
     ThreadingHTTPServer(("0.0.0.0", 8080), make_handler(TagReference())).serve_forever()
 ```
 
+## Appendix E: Alibaba Cloud Tag Policy and Cloud Config
+
+This is a platform-workspace configuration that renders the tag policy from the daily snapshot (`tag-reference.json`, same shape as section 4). Checked with `terraform validate` against `aliyun/alicloud` 1.293.0; the rendered policy JSON was inspected with `terraform console`. Argument names, the lowercase policy-key rule, `required-tags` parameters (`tag1Key` … `tag6Key`) and resource type codes (`ACS::ECS::Instance`, …) were checked against the provider and Alibaba Cloud docs. Apply it to a single non-production member folder first.
+
+```hcl
+terraform {
+  required_providers {
+    alicloud = {
+      source  = "aliyun/alicloud"
+      version = ">= 1.243.0"
+    }
+  }
+}
+
+variable "tag_reference_path" {
+  description = "Daily snapshot produced by the Tag Reference pipeline."
+  type        = string
+  default     = "tag-reference.json"
+}
+
+variable "target_folder_id" {
+  description = "Resource Directory folder the policy is attached to (test on a single member first)."
+  type        = string
+}
+
+locals {
+  ref = jsondecode(file(var.tag_reference_path))
+
+  # Policy keys must be lowercase; tag_key carries the case-sensitive tag name.
+  # Allow-lists (can intercept) for low-cardinality keys; regex (matched_tags: detect and
+  # remediate only, no interception) for high-cardinality keys such as WBS codes.
+  tag_policy = {
+    tags = {
+      costcenter = {
+        tag_key      = { "@@assign" = "CostCenter" }
+        tag_value    = { "@@assign" = sort(keys(local.ref.cost_centers)) }
+        enforced_for = { "@@assign" = ["ecs:instance", "rds:instance"] }
+      }
+      applicationid = {
+        tag_key      = { "@@assign" = "ApplicationID" }
+        tag_value    = { "@@assign" = sort(keys(local.ref.applications)) }
+        enforced_for = { "@@assign" = ["ecs:instance", "rds:instance"] }
+      }
+    }
+    matched_tags = {
+      wbscode = {
+        tag_key   = { "@@assign" = "WBSCode" }
+        tag_value = { "@@assign" = "^[A-Z]-[0-9]{6}(\\.[0-9]{2})*$" }
+      }
+    }
+  }
+}
+
+resource "alicloud_tag_policy" "mandatory" {
+  policy_name    = "mandatory_cmdb_finance_tags"
+  policy_desc    = "Generated from ServiceNow/SAP snapshot ${local.ref.generated_at}"
+  user_type      = "RD"
+  policy_content = jsonencode(local.tag_policy)
+}
+
+resource "alicloud_tag_policy_attachment" "folder" {
+  policy_id   = alicloud_tag_policy.mandatory.id
+  target_id   = var.target_folder_id
+  target_type = "FOLDER"
+}
+
+# Detective control: presence of all mandatory tags (managed rule supports up to 6 tags).
+resource "alicloud_config_rule" "required_tags" {
+  rule_name                 = "required-cmdb-finance-tags"
+  source_owner              = "ALIYUN"
+  source_identifier         = "required-tags"
+  risk_level                = 1
+  config_rule_trigger_types = "ConfigurationItemChangeNotification"
+  resource_types_scope      = ["ACS::ECS::Instance", "ACS::RDS::DBInstance", "ACS::OSS::Bucket", "ACS::VPC::VPC"]
+  input_parameters = {
+    tag1Key = "ApplicationID"
+    tag2Key = "ApplicationOwner"
+    tag3Key = "BusinessOwner"
+    tag4Key = "CostCenter"
+    tag5Key = "WBSCode"
+  }
+}
+```
+
+For value checks against ServiceNow/SAP on existing resources, add a custom rule with `source_owner = "CUSTOM_FC"` whose `source_identifier` is the ARN of a Function Compute function. Cloud Config invokes it with the configuration item, and the function returns compliance through `PutEvaluations`.
+
 ---
 
 ## Sources
 
-HashiCorp documentation was read from its source repository, [`hashicorp/web-unified-docs`](https://github.com/hashicorp/web-unified-docs) (commit `a6140de`, 2026-09-28), because `developer.hashicorp.com` was not reachable from the research environment. The published URLs are:
+All sources were read on 2026-09-28. HashiCorp pages were checked on `developer.hashicorp.com` and in their source repository [`hashicorp/web-unified-docs`](https://github.com/hashicorp/web-unified-docs) (commit `a6140de`).
+
+HashiCorp:
 
 - HCP Terraform run tasks: [settings, stages, enforcement, agent source](https://developer.hashicorp.com/terraform/cloud-docs/workspaces/settings/run-tasks) · [integration guide](https://developer.hashicorp.com/terraform/cloud-docs/integrations/run-tasks) · [integration API: payload, callback, outcomes](https://developer.hashicorp.com/terraform/cloud-docs/api-docs/tasks/run-tasks-integration)
 - Agents: [request forwarding](https://developer.hashicorp.com/terraform/cloud-docs/agents/request-forwarding) · [agent `-accept` job types](https://developer.hashicorp.com/terraform/cloud-docs/agents/agents)
+- Plans: [HCP Terraform plans and feature comparison](https://developer.hashicorp.com/terraform/cloud-docs/overview) · [pricing](https://www.hashicorp.com/products/terraform/pricing)
 - Policies: [manage policy sets, policy checks vs evaluations, enforcement levels](https://developer.hashicorp.com/terraform/cloud-docs/policy-enforcement/manage-policy-sets) · [Sentinel VCS policy sets and modules](https://developer.hashicorp.com/terraform/cloud-docs/policy-enforcement/manage-policy-sets/vcs/sentinel-vcs) · [OPA in HCP Terraform](https://developer.hashicorp.com/terraform/cloud-docs/policy-enforcement/define-policies/opa) · [policy sets API (`agent-enabled`, `policy-tool-version`)](https://developer.hashicorp.com/terraform/cloud-docs/api-docs/policy-sets) · [IP ranges API](https://developer.hashicorp.com/terraform/cloud-docs/api-docs/ip-ranges) · [IP ranges architecture](https://developer.hashicorp.com/terraform/cloud-docs/architectural-details/ip-ranges)
 - Sentinel: [`http` import](https://developer.hashicorp.com/sentinel/docs/imports/http) · [configuration and static imports](https://developer.hashicorp.com/sentinel/docs/configuration)
 - Terraform policy (beta): [compare policy frameworks](https://developer.hashicorp.com/terraform/policy/compare) · [`core::gethttprequest`](https://developer.hashicorp.com/terraform/policy/reference/functions/gethttprequest) · [`resource_policy`](https://developer.hashicorp.com/terraform/policy/reference/policy/resource-policy) · [HCP Terraform setup](https://developer.hashicorp.com/terraform/cloud-docs/policy-enforcement/define-policies/terraform-policy)
@@ -737,11 +836,14 @@ Reference repositories:
 - [hashicorp/terraform-run-task-scaffolding-go](https://github.com/hashicorp/terraform-run-task-scaffolding-go): official Go run task template (HMAC, callbacks)
 - [straubt1/terraform-run-task](https://github.com/straubt1/terraform-run-task): all four stages, plan and config download
 - [aws-ia/terraform-aws-runtask-iam-access-analyzer](https://github.com/aws-ia/terraform-aws-runtask-iam-access-analyzer): production serverless run task pattern (Lambda + WAF), transferable to Function Compute
-- [hashicorp/terraform-sentinel-policies](https://github.com/hashicorp/terraform-sentinel-policies): `enforce-mandatory-tags`, `tfplan-functions` (`find_resources_by_provider`, `filter_attribute_map_key_contains_items_not_in_list`)
+- [hashicorp/terraform-sentinel-policies](https://github.com/hashicorp/terraform-sentinel-policies): `enforce-mandatory-tags`, `tfplan-functions` (`find_resources_by_provider`, `filter_attribute_map_key_contains_items_not_in_list`), and [`http-examples`](https://github.com/hashicorp/terraform-sentinel-policies/tree/main/cloud-agnostic/http-examples) for Sentinel HTTP lookups
 - [hashicorp/terraform-policy-plugin-framework](https://github.com/hashicorp/terraform-policy-plugin-framework): plugins for Terraform policy (beta)
 - [aliyun/terraform-provider-alicloud](https://github.com/aliyun/terraform-provider-alicloud): provider arguments (no `default_tags`), [`alicloud_tag_policy`](https://registry.terraform.io/providers/aliyun/alicloud/latest/docs/resources/tag_policy), [`alicloud_config_rule`](https://registry.terraform.io/providers/aliyun/alicloud/latest/docs/resources/config_rule), [RAM user not taggable (#8998)](https://github.com/aliyun/terraform-provider-alicloud/issues/8998)
 
-Alibaba Cloud, ServiceNow and SAP (from search excerpts, because `alibabacloud.com` was not reachable from the research environment; verify limits before relying on them):
-- [Tag policy overview](https://www.alibabacloud.com/help/en/resource-management/tag/user-guide/overview) · [tag policy syntax](https://www.alibabacloud.com/help/en/resource-management/tag/user-guide/syntax-of-a-tag-policy) · [pre-event interception](https://www.alibabacloud.com/help/en/resource-management/tag/user-guide/enable-tag-compliance-enforcement) · [Cloud Config `required-tags`](https://www.alibabacloud.com/help/en/cloud-config/latest/b5m012) · [Cloud Config custom function rules](https://www.alibabacloud.com/help/en/cloud-config/latest/custom-rule-functions)
-- [ServiceNow CMDB tables](https://www.servicenow.com/docs/r/servicenow-platform/configuration-management-database-cmdb/cmdb-tables-details.html) · [Business application owner fields](https://www.servicenow.com/community/common-service-data-model-forum/purpose-of-added-ba-user-fields-quot-it-application-owner-quot/m-p/334798)
-- [SAP Enterprise Project API](https://help.sap.com/docs/SAP_S4HANA_CLOUD/988903b47d7040f6ac4ec02e44bb58e4/b467d86283be4a56869f1e6784e47b64.html) · [Cost Center APIs in S/4HANA Cloud](https://community.sap.com/t5/enterprise-resource-planning-blog-posts-by-sap/a-practical-guide-to-cost-center-apis-in-sap-s-4hana-cloud/ba-p/14229337)
+Alibaba Cloud (read directly):
+- Tag policies: [overview and supported services / interception coverage](https://www.alibabacloud.com/help/en/resource-management/tag/user-guide/overview) · [syntax](https://www.alibabacloud.com/help/en/resource-management/tag/user-guide/syntax-of-a-tag-policy) · [pre-event interception and strong validation](https://www.alibabacloud.com/help/en/resource-management/tag/user-guide/enable-tag-compliance-enforcement) · [CreatePolicy API](https://www.alibabacloud.com/help/en/resource-management/tag/developer-reference/api-tag-2018-08-28-createpolicy) · [Resource Management limits (tag keys and values)](https://www.alibabacloud.com/help/en/resource-management/product-overview/limits)
+- Cloud Config: [`required-tags` managed rule](https://www.alibabacloud.com/help/en/cloud-config/latest/b5m012) · [custom function rules](https://www.alibabacloud.com/help/en/cloud-config/latest/custom-rule-functions) · [supported resource types](https://www.alibabacloud.com/help/en/cloud-config/latest/alibaba-cloud-services-that-are-supported-by-cloud-config)
+
+ServiceNow and SAP (guidance only; confirm against your instance and S/4HANA edition):
+- ServiceNow: [Dot-walking in the REST Table API](https://developer.servicenow.com/blog.do?p=%2Fpost%2Fdot-walking-in-the-rest-table-api-2%2F) · [Table API reference](https://www.servicenow.com/docs/r/api-reference/rest-apis/c_TableAPI.html) · [CMDB tables](https://www.servicenow.com/docs/r/servicenow-platform/configuration-management-database-cmdb/cmdb-tables-details.html) · [business application owner fields](https://www.servicenow.com/community/common-service-data-model-forum/purpose-of-added-ba-user-fields-quot-it-application-owner-quot/m-p/334798)
+- SAP: [Enterprise Project API](https://help.sap.com/docs/SAP_S4HANA_CLOUD/988903b47d7040f6ac4ec02e44bb58e4/b467d86283be4a56869f1e6784e47b64.html) · [Cost center APIs in S/4HANA Cloud](https://community.sap.com/t5/enterprise-resource-planning-blog-posts-by-sap/a-practical-guide-to-cost-center-apis-in-sap-s-4hana-cloud/ba-p/14229337) · [APIs on SAP Business Accelerator Hub](https://help.sap.com/docs/SAP_S4HANA_ON-PREMISE/8308e6d301d54584a33cd04a9861bc52/1e60f14bdc224c2c975c8fa8bcfd7f3f.html)
