@@ -1,0 +1,17 @@
+resource_changes = {
+  "alicloud_vpc.main": {
+    "address": "alicloud_vpc.main", "mode": "managed", "type": "alicloud_vpc", "name": "main",
+    "provider_name": "registry.terraform.io/aliyun/alicloud",
+    "change": {"actions": ["create"], "after": {"vpc_name": "app-vpc", "cidr_block": "10.0.0.0/16", "tags": {"ApplicationID": "APM0001234", "CostCenter": "CC10001"}}, "after_unknown": {"id": true}},
+  },
+  "alicloud_security_group_rule.app": {
+    "address": "alicloud_security_group_rule.app", "mode": "managed", "type": "alicloud_security_group_rule", "name": "app",
+    "provider_name": "registry.terraform.io/aliyun/alicloud",
+    "change": {"actions": ["create"], "after": {"type": "ingress"}, "after_unknown": {"id": true}},
+  },
+  "alicloud_vswitch.old": {
+    "address": "alicloud_vswitch.old", "mode": "managed", "type": "alicloud_vswitch", "name": "old",
+    "provider_name": "registry.terraform.io/aliyun/alicloud",
+    "change": {"actions": ["delete"], "after": null, "after_unknown": {}},
+  },
+}

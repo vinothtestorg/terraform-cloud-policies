@@ -1,0 +1,16 @@
+# Terraform / Stacks working files
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Child modules are not run on their own, so their lock files are not kept
+examples/stack/modules/**/.terraform.lock.hcl
+
+# Python
+__pycache__/
+*.pyc
+
+# Sentinel CLI test cache
+.sentinel/

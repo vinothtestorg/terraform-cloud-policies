@@ -1,0 +1,89 @@
+# Validates mandatory tags on every AliCloud resource created or updated in the plan
+# against the daily ServiceNow/SAP snapshot (module "tag_reference").
+import "tfplan/v2" as tfplan
+import "time"
+import "strings"
+import "tag_reference" as ref
+
+param mandatory_tags default ["ApplicationID", "ApplicationOwner", "BusinessOwner", "CostCenter", "WBSCode"]
+param max_snapshot_age_hours default 48
+param check_wbs_cost_center default true
+
+# AliCloud managed resources being created/updated that support a "tags" argument
+# (a wholly unknown tags map is absent from "after" and flagged in "after_unknown")
+in_scope = filter tfplan.resource_changes as _, rc {
+	rc.mode is "managed" and
+		strings.has_prefix(rc.type, "alicloud_") and
+		(rc.change.actions contains "create" or rc.change.actions contains "update") and
+		(keys(rc.change.after) contains "tags" or (rc.change.after_unknown.tags else false) is true)
+}
+
+# Returns a list of human-readable violations for one resource
+violations_for = func(rc) {
+	v = []
+	if (rc.change.after_unknown.tags else false) is true {
+		return ["tags are unknown until apply - tag values must be known at plan time"]
+	}
+	tags = rc.change.after.tags else {}
+	if tags is null {
+		tags = {}
+	}
+	for mandatory_tags as k {
+		if (tags[k] else "") is "" {
+			append(v, "missing tag '" + k + "'")
+		}
+	}
+	if length(v) > 0 {
+		return v
+	}
+
+	app = ref.applications[tags.ApplicationID] else null
+	if app is null {
+		append(v, "ApplicationID '" + tags.ApplicationID + "' not found/active in ServiceNow")
+	} else {
+		if strings.to_lower(tags.ApplicationOwner) is not app.app_owner {
+			append(v, "ApplicationOwner does not match ServiceNow (expected " + app.app_owner + ")")
+		}
+		if strings.to_lower(tags.BusinessOwner) is not app.business_owner {
+			append(v, "BusinessOwner does not match ServiceNow (expected " + app.business_owner + ")")
+		}
+	}
+	if (ref.cost_centers[tags.CostCenter] else null) is null {
+		append(v, "CostCenter '" + tags.CostCenter + "' not found/active in SAP")
+	}
+	wbs = ref.wbs_elements[tags.WBSCode] else null
+	if wbs is null {
+		append(v, "WBSCode '" + tags.WBSCode + "' not found/released in SAP")
+	} else if check_wbs_cost_center and wbs.cost_center is not tags.CostCenter {
+		append(v, "WBSCode '" + tags.WBSCode + "' belongs to cost center " + wbs.cost_center)
+	}
+	return v
+}
+
+violations = {}
+for in_scope as addr, rc {
+	v = violations_for(rc)
+	if length(v) > 0 {
+		violations[addr] = v
+		print(addr + ": " + strings.join(v, "; "))
+	}
+}
+
+snapshot_age_ok = time.now.sub(time.load(ref.generated_at)) < max_snapshot_age_hours * time.hour
+if not snapshot_age_ok {
+	print("tag_reference snapshot generated at " + ref.generated_at + " is older than " +
+		string(max_snapshot_age_hours) +
+		"h - check the SNOW/SAP sync job")
+}
+
+snapshot_fresh = rule {
+	snapshot_age_ok
+}
+
+tags_valid = rule {
+	length(violations) is 0
+}
+
+main = rule {
+	snapshot_fresh and tags_valid
+}
